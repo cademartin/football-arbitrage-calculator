@@ -1,8 +1,21 @@
 import axios, { AxiosError } from 'axios';
 import { Match, BookmakerOdds } from '../types';
 
-const API_KEY = "92be5f2092808e096a11ddaa73648b97";
-const BASE_URL = 'https://api.the-odds-api.com/v4/sports';
+// API Keys
+const ODDS_API_KEY = "92be5f2092808e096a11ddaa73648b97";
+const BETFAIR_API_KEY = process.env.VITE_BETFAIR_API_KEY || "";
+const SPORTRADAR_KEY = process.env.VITE_SPORTRADAR_KEY || "";
+const RAPID_API_KEY = process.env.VITE_RAPID_API_KEY || "";
+const PINNACLE_API_KEY = process.env.VITE_PINNACLE_API_KEY || "";
+const ONEXBET_API_KEY = process.env.VITE_ONEXBET_API_KEY || "";
+
+// Base URLs
+const ODDS_API_URL = 'https://api.the-odds-api.com/v4/sports';
+const BETFAIR_URL = 'https://api.betfair.com/exchange/betting/rest/v1.0';
+const SPORTRADAR_URL = 'https://api.sportradar.us/odds/v4/en';
+const RAPID_API_URL = 'https://live-odds.p.rapidapi.com/v1';
+const PINNACLE_URL = 'https://api.pinnacle.com/v1';
+const ONEXBET_URL = 'https://1xbet.api-gateway.cloud';
 
 const BLACKLISTED_BOOKMAKERS = ['suprabets'];
 
@@ -17,21 +30,45 @@ export class ApiError extends Error {
   }
 }
 
-const api = axios.create({
-  baseURL: BASE_URL,
+// API instances
+const oddsApi = axios.create({
+  baseURL: ODDS_API_URL,
   timeout: 10000,
 });
 
-interface Sport {
-  key: string;
-  has_live_games: boolean;
-}
+const betfairApi = axios.create({
+  baseURL: BETFAIR_URL,
+  timeout: 10000,
+  headers: {
+    'X-Application': BETFAIR_API_KEY,
+    'Accept': 'application/json'
+  }
+});
 
+const rapidApi = axios.create({
+  baseURL: RAPID_API_URL,
+  timeout: 10000,
+  headers: {
+    'X-RapidAPI-Key': RAPID_API_KEY,
+    'X-RapidAPI-Host': 'live-odds.p.rapidapi.com'
+  }
+});
+
+const onexbetApi = axios.create({
+  baseURL: ONEXBET_URL,
+  timeout: 10000,
+  headers: {
+    'Authorization': `Bearer ${ONEXBET_API_KEY}`,
+    'Content-Type': 'application/json'
+  }
+});
+
+// Fetch upcoming matches from The Odds API
 export const fetchUpcomingMatches = async (): Promise<Match[]> => {
   try {
-    const response = await api.get('/upcoming/odds', {
+    const response = await oddsApi.get('/upcoming/odds', {
       params: {
-        apiKey: API_KEY,
+        apiKey: ODDS_API_KEY,
         regions: 'eu',
         markets: 'h2h',
         oddsFormat: 'decimal',
@@ -50,53 +87,148 @@ export const fetchUpcomingMatches = async (): Promise<Match[]> => {
   }
 };
 
+// Fetch live matches from multiple sources
 export const fetchLiveMatches = async (): Promise<Match[]> => {
   try {
-    // First, get all available soccer competitions
-    const sportsResponse = await api.get('/sports', {
-      params: { apiKey: API_KEY }
-    });
+    const [betfairMatches, rapidApiMatches, onexbetMatches] = await Promise.allSettled([
+      fetchBetfairLiveMatches(),
+      fetchRapidApiLiveMatches(),
+      fetch1xBetLiveMatches()
+    ]);
 
-    // Filter for soccer competitions only
-    const soccerSports = sportsResponse.data.filter(
-      (sport: any) => sport.key.includes('soccer') && sport.active
-    );
+    const allMatches: Match[] = [];
 
-    console.log('Available soccer competitions:', soccerSports);
+    if (betfairMatches.status === 'fulfilled') {
+      allMatches.push(...betfairMatches.value);
+    }
+    if (rapidApiMatches.status === 'fulfilled') {
+      allMatches.push(...rapidApiMatches.value);
+    }
+    if (onexbetMatches.status === 'fulfilled') {
+      allMatches.push(...onexbetMatches.value);
+    }
 
-    // Fetch odds for each soccer competition
-    const matchPromises = soccerSports.map(sport => 
-      api.get(`/${sport.key}/odds`, {
-        params: {
-          apiKey: API_KEY,
-          regions: 'eu',
-          markets: 'h2h',
-          oddsFormat: 'decimal',
-          dateFormat: 'iso'
-        }
-      })
-    );
+    const uniqueMatches = removeDuplicateMatches(allMatches);
+    console.log('Found live matches:', uniqueMatches.length);
+    return uniqueMatches;
 
-    const responses = await Promise.all(matchPromises);
-    
-    // Filter for matches that are currently in-play
-    const now = new Date();
-    const allMatches = responses.flatMap(response => response.data || []);
-    const liveMatches = allMatches.filter((match: Match) => {
-      const matchTime = new Date(match.commence_time);
-      // Consider a match "live" if it started within the last 2 hours
-      return matchTime <= now && matchTime >= new Date(now.getTime() - 2 * 60 * 60 * 1000);
-    });
-
-    console.log('Found live matches:', liveMatches);
-
-    return liveMatches;
   } catch (error) {
-    console.error('Error fetching live matches:', error);
     handleApiError(error);
     return [];
   }
 };
+
+// Betfair live matches
+async function fetchBetfairLiveMatches(): Promise<Match[]> {
+  try {
+    const response = await betfairApi.get('/listEvents', {
+      params: {
+        filter: {
+          eventTypeIds: ['1'], // Soccer
+          inPlayOnly: true
+        }
+      }
+    });
+
+    return response.data.map((event: any) => ({
+      id: `betfair_${event.event.id}`,
+      sport_key: 'soccer',
+      sport_title: 'Soccer',
+      commence_time: event.event.openDate,
+      home_team: event.event.name.split(' v ')[0],
+      away_team: event.event.name.split(' v ')[1],
+      bookmakers: [{
+        key: 'betfair',
+        title: 'Betfair',
+        markets: event.markets
+      }]
+    }));
+  } catch (error) {
+    console.error('Betfair API error:', error);
+    return [];
+  }
+}
+
+// RapidAPI live matches
+async function fetchRapidApiLiveMatches(): Promise<Match[]> {
+  try {
+    const response = await rapidApi.get('/events/live', {
+      params: {
+        sport: 'soccer',
+        region: 'eu'
+      }
+    });
+
+    return response.data.events.map((event: any) => ({
+      id: `rapid_${event.event_id}`,
+      sport_key: 'soccer',
+      sport_title: 'Soccer',
+      commence_time: event.start_time,
+      home_team: event.home_team,
+      away_team: event.away_team,
+      bookmakers: event.bookmakers
+    }));
+  } catch (error) {
+    console.error('RapidAPI error:', error);
+    return [];
+  }
+}
+
+// 1xBet live matches
+async function fetch1xBetLiveMatches(): Promise<Match[]> {
+  try {
+    const response = await onexbetApi.get('/sports/live', {
+      params: {
+        sport: 'Soccer',
+        market_type: 'match_odds'
+      }
+    });
+
+    return response.data.events.map((event: any) => ({
+      id: `1xbet_${event.id}`,
+      sport_key: 'soccer',
+      sport_title: 'Soccer',
+      commence_time: event.startTime,
+      home_team: event.home.name,
+      away_team: event.away.name,
+      bookmakers: [{
+        key: '1xbet',
+        title: '1xBet',
+        markets: [{
+          key: 'h2h',
+          outcomes: [
+            {
+              name: event.home.name,
+              price: event.markets.match_odds.home
+            },
+            {
+              name: 'Draw',
+              price: event.markets.match_odds.draw
+            },
+            {
+              name: event.away.name,
+              price: event.markets.match_odds.away
+            }
+          ]
+        }]
+      }]
+    }));
+  } catch (error) {
+    console.error('1xBet API error:', error);
+    return [];
+  }
+}
+
+// Remove duplicate matches based on team names
+function removeDuplicateMatches(matches: Match[]): Match[] {
+  const seen = new Set();
+  return matches.filter(match => {
+    const key = `${match.home_team}_${match.away_team}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 const handleApiError = (error: unknown) => {
   console.error('API Error:', error);
